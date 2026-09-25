@@ -692,6 +692,188 @@ def extract_all_patients(full_text: str, page_texts: List[str]) -> List[Dict[str
 
 
 # -----------------------------------------------------------------------------
+# AI Extraction (free tiers: Groq + Google Gemini)
+# -----------------------------------------------------------------------------
+AI_SYSTEM_PROMPT = """You are a medical document extraction specialist.
+Extract patient information from the OCR text of clinical referral / chart documents.
+Return ONLY valid JSON (no markdown, no commentary).
+
+If the document contains multiple distinct patients, return a JSON array of objects.
+If only one patient, still return a JSON array with one object.
+
+Each object must use exactly these keys (string or null):
+{
+  "patient_name": null,
+  "phone": null,
+  "dob": null,
+  "email": null,
+  "diagnosis": null,
+  "referrer": null,
+  "address": null,
+  "insurance": null,
+  "height": null,
+  "weight": null,
+  "bmi": null
+}
+
+Rules:
+- patient_name: full name only (no titles unless part of the name)
+- phone: format as (XXX) XXX-XXXX when possible
+- dob: keep original format found (MM/DD/YYYY preferred)
+- diagnosis: primary / billing diagnosis; include secondary only if clearly important
+- referrer: ordering provider, referring physician, or PCP name
+- height: prefer ft'in" (e.g. 5'3") or cm
+- weight: include unit (lbs or kg)
+- bmi: numeric value only
+- Use null when a field is truly absent
+- Never invent data that is not present in the text
+"""
+
+def _normalize_ai_patient(obj: dict) -> Dict[str, Optional[str]]:
+    """Map AI JSON keys into our internal schema and clean values."""
+    key_map = {
+        "patient_name": "patient_name",
+        "name": "patient_name",
+        "pt_name": "patient_name",
+        "phone": "phone",
+        "phone_number": "phone",
+        "dob": "dob",
+        "date_of_birth": "dob",
+        "email": "email",
+        "diagnosis": "diagnosis",
+        "referrer": "referrer",
+        "referring_provider": "referrer",
+        "ordering_provider": "referrer",
+        "address": "address",
+        "insurance": "insurance",
+        "height": "height",
+        "weight": "weight",
+        "bmi": "bmi",
+    }
+    out = {k: None for k in FIELD_LABELS}
+    if not isinstance(obj, dict):
+        return out
+    for k, v in obj.items():
+        canon = key_map.get(str(k).lower().strip())
+        if canon and v is not None and str(v).strip().lower() not in ("null", "none", "n/a", ""):
+            out[canon] = str(v).strip()[:220]
+    return out
+
+
+def extract_with_groq(text: str, api_key: str, model: str = "llama-3.3-70b-versatile") -> List[Dict[str, Optional[str]]]:
+    """Call Groq free API for structured extraction."""
+    try:
+        from groq import Groq
+    except ImportError:
+        st.error("groq package not installed. Add `groq` to requirements.txt")
+        return []
+
+    client = Groq(api_key=api_key)
+    # Truncate very long OCR to stay within context (keep start + end)
+    if len(text) > 28000:
+        text = text[:14000] + "\n\n[... middle truncated ...]\n\n" + text[-14000:]
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": AI_SYSTEM_PROMPT},
+            {"role": "user", "content": f"OCR text of the medical document:\n\n{text}"},
+        ],
+        temperature=0.1,
+        max_tokens=2048,
+        response_format={"type": "json_object"},
+    )
+    raw = response.choices[0].message.content
+    data = json.loads(raw)
+
+    # Accept either {"patients": [...]} or a bare list or a single object
+    if isinstance(data, dict):
+        if "patients" in data and isinstance(data["patients"], list):
+            items = data["patients"]
+        else:
+            items = [data]
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+
+    return [_normalize_ai_patient(item) for item in items if isinstance(item, dict)]
+
+
+def extract_with_gemini(text: str, api_key: str, model: str = "gemini-2.0-flash") -> List[Dict[str, Optional[str]]]:
+    """Call Google Gemini free API for structured extraction."""
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        st.error("google-generativeai package not installed. Add it to requirements.txt and redeploy.")
+        return []
+
+    genai.configure(api_key=api_key)
+    if len(text) > 28000:
+        text = text[:14000] + "\n\n[... middle truncated ...]\n\n" + text[-14000:]
+
+    # Try current free-tier friendly models in order
+    candidate_models = [model, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-latest"]
+    last_err = None
+    raw = None
+
+    for model_name in candidate_models:
+        try:
+            model_obj = genai.GenerativeModel(
+                model_name=model_name,
+                system_instruction=AI_SYSTEM_PROMPT,
+                generation_config={
+                    "temperature": 0.1,
+                    "max_output_tokens": 2048,
+                    "response_mime_type": "application/json",
+                },
+            )
+            response = model_obj.generate_content(
+                f"OCR text of the medical document:\n\n{text}"
+            )
+            raw = response.text
+            break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if raw is None:
+        raise RuntimeError(f"Gemini models failed. Last error: {last_err}")
+
+    data = json.loads(raw)
+
+    if isinstance(data, dict):
+        if "patients" in data and isinstance(data["patients"], list):
+            items = data["patients"]
+        else:
+            items = [data]
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+
+    return [_normalize_ai_patient(item) for item in items if isinstance(item, dict)]
+
+
+def extract_with_ai(full_text: str, provider: str, api_key: str) -> List[Dict[str, Optional[str]]]:
+    """Dispatch to the selected free AI provider."""
+    if not api_key or not api_key.strip():
+        return []
+    provider = (provider or "").lower()
+    try:
+        if provider == "groq":
+            return extract_with_groq(full_text, api_key.strip())
+        elif provider in ("gemini", "google"):
+            return extract_with_gemini(full_text, api_key.strip())
+        else:
+            st.warning(f"Unknown AI provider: {provider}")
+            return []
+    except Exception as e:
+        st.error(f"AI extraction failed ({provider}): {e}")
+        return []
+
+
+# -----------------------------------------------------------------------------
 # Streamlit UI
 # -----------------------------------------------------------------------------
 def patient_to_display_dict(p: Dict[str, Optional[str]], idx: int) -> Dict[str, Any]:
@@ -726,6 +908,40 @@ def main():
         show_images = st.checkbox("Show page previews", value=False)
         force_single = st.checkbox("Force single-patient mode", value=False,
                                    help="Disable multi-patient splitting")
+
+        st.markdown("---")
+        st.header("🤖 Free AI Extraction")
+        st.caption("Optional — greatly improves accuracy on varied formats. Free tiers available.")
+
+        # Prefer Streamlit secrets if present (recommended on Cloud)
+        # Default provider is Gemini (user preference)
+        default_provider = "Gemini"
+        default_key = ""
+        try:
+            if "GEMINI_API_KEY" in st.secrets or "GOOGLE_API_KEY" in st.secrets:
+                default_key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("GOOGLE_API_KEY")
+                default_provider = "Gemini"
+            elif "GROQ_API_KEY" in st.secrets:
+                default_key = st.secrets["GROQ_API_KEY"]
+                default_provider = "Groq"
+        except Exception:
+            pass
+
+        ai_provider = st.selectbox(
+            "AI Provider",
+            options=["Gemini", "Groq", "None (rules only)"],
+            index=0 if default_provider == "Gemini" else (1 if default_provider == "Groq" else 2),
+            help="Gemini (Google) is recommended. Free API key from Google AI Studio.",
+        )
+        ai_api_key = st.text_input(
+            "Gemini / Groq API Key",
+            value=default_key,
+            type="password",
+            help="Get a free Gemini key: https://aistudio.google.com/apikey",
+            placeholder="Paste your free Gemini API key here",
+        )
+        use_ai = ai_provider != "None (rules only)" and bool(ai_api_key.strip())
+
         st.markdown("---")
         st.markdown(
             """
@@ -733,14 +949,14 @@ def main():
             PDF · PNG · JPG · TIFF · BMP
 
             **Best accuracy**  
+            • Enable free AI (Groq / Gemini)  
             • ≥ 200–300 DPI scans  
             • Clear printed text  
-            • Good contrast  
 
             Always review results — medical data is critical.
             """
         )
-        st.caption("Privacy: nothing leaves your machine.")
+        st.caption("OCR is local. AI (if enabled) sends OCR text only to the chosen provider.")
 
     uploaded = st.file_uploader(
         "Upload PDF or Image (supports multiple patients)",
@@ -777,19 +993,36 @@ def main():
             st.text_area("Raw text", full_text or "(empty)", height=200)
         return
 
-    # Extract patients
-    with st.spinner("Intelligently detecting patients & extracting fields…"):
-        if force_single:
-            patients = [extract_fields_from_block(full_text)]
-        else:
-            patients = extract_all_patients(full_text, page_texts)
+    # Extract patients — prefer free AI when configured, else rules engine
+    patients: List[Dict[str, Optional[str]]] = []
+    extraction_method = "rules"
+
+    if use_ai:
+        with st.spinner(f"🤖 AI extraction via {ai_provider}…"):
+            ai_patients = extract_with_ai(full_text, ai_provider, ai_api_key)
+            if ai_patients:
+                # Keep only records that have at least a name or several fields
+                for p in ai_patients:
+                    filled = sum(1 for v in p.values() if v)
+                    if p.get("patient_name") or filled >= 3:
+                        patients.append(p)
+                if patients:
+                    extraction_method = f"AI ({ai_provider})"
+
+    if not patients:
+        with st.spinner("Intelligently detecting patients & extracting fields (rules engine)…"):
+            if force_single:
+                patients = [extract_fields_from_block(full_text)]
+            else:
+                patients = extract_all_patients(full_text, page_texts)
+            extraction_method = "rules"
 
     n = len(patients)
     if n == 0:
         st.warning("No patient records detected.")
         return
 
-    st.success(f"✅ Detected **{n}** patient record{'s' if n != 1 else ''}")
+    st.success(f"✅ Detected **{n}** patient record{'s' if n != 1 else ''}  ·  method: **{extraction_method}**")
 
     # ------------------------------------------------------------------
     # Easy-to-copy main table

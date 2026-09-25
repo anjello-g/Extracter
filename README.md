@@ -1,37 +1,40 @@
-# Patient Detail Extractor (Multi-Patient)
+# Patient Detail Extractor (Multi-Patient + Gemini AI)
 
 Ultra-accurate Streamlit app that extracts critical patient information from **PDFs** (text or scanned) and **images**.  
-Supports **multiple patients** in a single file.
+Optional **free Google Gemini AI** for best accuracy across varied clinical formats.
 
-## Deploy on Streamlit Community Cloud (GitHub)
+## Quick setup with Gemini (recommended)
 
-1. Create a new GitHub repository and push these files:
+1. Get a **free** Gemini API key:  
+   → [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey)
+
+2. Push these files to the **root** of your GitHub repo:
    ```
    app.py
    requirements.txt
-   packages.txt          ← required for Tesseract + Poppler
+   packages.txt
    README.md
    ```
 
-2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**
-   - Repository: your GitHub repo
-   - Branch: `main` (or whatever you use)
-   - Main file path: `app.py`
+3. Deploy on [share.streamlit.io](https://share.streamlit.io) (Main file: `app.py`)
 
-3. Click **Deploy**. Streamlit Cloud will install the system packages listed in `packages.txt` and the Python packages from `requirements.txt`.
+4. Add the key in **App settings → Secrets**:
+   ```toml
+   GEMINI_API_KEY = "AIza..."
+   ```
 
-4. After the first deploy finishes, **reboot the app** once (⋮ menu → Reboot) so Tesseract is fully available.
+5. **Reboot** the app once (so Tesseract + packages load).
 
-### Required files for Cloud
+6. In the sidebar, keep **AI Provider = Gemini**. Upload a document.
 
-**`packages.txt`** (system packages – already included):
+### `packages.txt` (required on Streamlit Cloud)
 ```
 tesseract-ocr
 tesseract-ocr-eng
 poppler-utils
 ```
 
-**`requirements.txt`**:
+### `requirements.txt`
 ```
 streamlit>=1.28.0
 pdfplumber>=0.10.0
@@ -40,38 +43,34 @@ pytesseract>=0.3.10
 Pillow>=10.0.0
 numpy>=1.24.0
 pypdfium2>=4.0.0
+groq>=0.9.0
+google-generativeai>=0.7.0
 ```
 
-## Local run
+## How it works
 
-```bash
-# System deps (Ubuntu/Debian)
-sudo apt-get install -y tesseract-ocr poppler-utils
-
-# Python
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## Features
-
-- **Multi-patient** detection & separation
-- Hybrid native-text + multi-config OCR
-- Aggressive image preprocessing for accuracy
-- Label-aware extraction + validation
-- Auto BMI calculation
-- Easy-to-copy table, plain-text blocks, JSON / CSV / TSV export
-- Fully local processing (no external APIs)
+1. PDF/image is OCR’d **locally** (Tesseract).
+2. OCR text is sent to **Gemini** (only when you enable AI + provide a key).
+3. Gemini returns clean structured JSON for one or many patients.
+4. You can edit any field before exporting JSON / CSV / TSV.
+5. If no key is set, a strong rules engine still runs as fallback.
 
 ## Extracted fields
 
 PT's Name · Phone · DOB · Email · Diagnosis · Referrer · Address · Insurance · Height · Weight · BMI
 
-## Notes for Streamlit Cloud
+## Local run
 
-- Scanned PDFs use OCR → can be slower / more memory-intensive on the free tier.
-- Prefer ≤ 10–15 page documents when possible.
-- If you see “Tesseract is not available”, confirm `packages.txt` is in the **root** of the repo and reboot the app.
-- Text-layer PDFs (not scanned) work even without Tesseract.
+```bash
+sudo apt-get install -y tesseract-ocr poppler-utils
+pip install -r requirements.txt
+streamlit run app.py
+```
 
-Always review extracted values — this is medical data.
+Paste your Gemini key in the sidebar (or set `GEMINI_API_KEY` in secrets).
+
+## Privacy
+
+- OCR runs on the Streamlit server.
+- Only the extracted text is sent to Google Gemini when AI is enabled.
+- Always review results — this is medical data.
