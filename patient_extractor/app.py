@@ -228,34 +228,67 @@ def ocr_image(img: Image.Image, lang: str = "eng") -> str:
 # -----------------------------------------------------------------------------
 # PDF / Image → Text
 # -----------------------------------------------------------------------------
+def _render_pdf_pages_pypdfium2(file_bytes: bytes, dpi: int = 300) -> List[Image.Image]:
+    """Reliable pure-Python PDF → PIL images via pypdfium2 (no poppler needed)."""
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(file_bytes)
+    scale = dpi / 72.0
+    images = []
+    for i in range(len(pdf)):
+        page = pdf[i]
+        bitmap = page.render(scale=scale)
+        pil_image = bitmap.to_pil()
+        images.append(pil_image)
+        page.close()
+    pdf.close()
+    return images
+
+
 def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, List[Image.Image], List[str]]:
     """
     Returns (full_text, page_images, page_texts)
     page_texts keeps per-page text for better multi-patient splitting.
+    Robust: tries pdfplumber → pdf2image → pypdfium2 fallback.
     """
     page_texts: List[str] = []
     images: List[Image.Image] = []
 
+    # 1. Native text layer via pdfplumber
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
                 page_text = page.extract_text() or ""
                 page_texts.append(page_text)
                 try:
-                    im = page.to_image(resolution=220).original
+                    im = page.to_image(resolution=200).original
                     images.append(im)
                 except Exception:
                     pass
     except Exception as e:
-        st.warning(f"pdfplumber: {e}")
+        st.warning(f"pdfplumber text extraction issue: {e}")
 
     full_text = "\n\n".join(page_texts).strip()
     alpha = len(re.findall(r"[A-Za-z0-9]", full_text))
 
-    if alpha < 150:  # likely scanned
+    # 2. If sparse text → treat as scanned and OCR
+    if alpha < 150:
         st.info("📄 Scanned / image-based PDF detected → running high-quality OCR…")
+        ocr_images: List[Image.Image] = []
+
+        # Try A: pdf2image (poppler)
         try:
             ocr_images = convert_from_bytes(file_bytes, dpi=300)
+        except Exception as e1:
+            st.warning(f"pdf2image/poppler path failed ({e1}). Trying alternative renderer…")
+            # Try B: pypdfium2 (pure Python, very reliable)
+            try:
+                ocr_images = _render_pdf_pages_pypdfium2(file_bytes, dpi=300)
+            except Exception as e2:
+                st.error(f"All PDF→image methods failed.\n• pdf2image: {e1}\n• pypdfium2: {e2}")
+                # Last resort: keep whatever images pdfplumber managed to give us
+                ocr_images = images
+
+        if ocr_images:
             images = ocr_images
             page_texts = []
             progress = st.progress(0.0, text="OCR in progress…")
@@ -264,8 +297,6 @@ def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, List[Image.Image], Li
                 progress.progress((i + 1) / len(ocr_images), text=f"OCR page {i+1}/{len(ocr_images)}")
             progress.empty()
             full_text = "\n\n".join(page_texts)
-        except Exception as e:
-            st.error(f"OCR failed: {e}")
 
     return full_text, images, page_texts
 
