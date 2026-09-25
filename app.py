@@ -53,30 +53,36 @@ FIELD_LABELS: Dict[str, List[str]] = {
         r"pt'?s?\s*name", r"patient\s*(?:'?s?\s*)?name", r"name\s*of\s*patient",
         r"patient'?s?\s*full\s*name", r"full\s*name", r"^name\s*[:\-]",
         r"pt\s*name", r"client\s*name", r"member\s*name", r"subscriber\s*name",
+        r"patient\s*information", r"^patient\s*[:\-]",
     ],
     "phone": [
         r"pt'?s?\s*phone", r"patient\s*phone", r"phone\s*(?:number|#)?",
-        r"telephone", r"mobile", r"cell\s*phone", r"contact\s*(?:number|phone)",
+        r"telephone", r"mobile", r"cell\s*phone", r"contact\s*(?:number|phone|:)",
         r"ph\s*[:\-#]", r"tel\s*[:\-]", r"home\s*phone", r"work\s*phone",
+        r"contact\s*[:\-]",
     ],
     "dob": [
         r"pt'?s?\s*dob", r"date\s*of\s*birth", r"d\.?o\.?b\.?", r"birth\s*date",
         r"born\s*on", r"dob\s*[:\-]", r"birthdate", r"date\s*born",
+        r"date\s*of\s*birth\s*[:\-]",
     ],
     "email": [
         r"pt'?s?\s*email", r"patient\s*email", r"e-?mail", r"email\s*address",
         r"email\s*[:\-]", r"e\s*mail",
     ],
     "diagnosis": [
-        r"pt'?s?\s*diagnosis", r"diagnosis", r"primary\s*diagnosis",
+        r"pt'?s?\s*diagnosis", r"primary\s*/?\s*billing\s*diagnosis",
+        r"primary\s*diagnosis", r"billing\s*diagnosis", r"diagnosis",
         r"dx\s*[:\-]", r"clinical\s*diagnosis", r"impression",
         r"assessment", r"condition", r"principal\s*diagnosis",
         r"working\s*diagnosis", r"final\s*diagnosis",
+        r"other\s*assessments?\s*at\s*time\s*of\s*order",
     ],
     "referrer": [
         r"referrer", r"referring\s*(?:physician|doctor|provider|md|dr|clinician)",
         r"referred\s*by", r"referral\s*(?:from|source)", r"ordering\s*provider",
         r"referring\s*md", r"referring\s*doctor", r"ordered\s*by",
+        r"ordering\s*provider\s*[:\-]", r"pcp\s*[:\-]", r"primary\s*care\s*provider",
     ],
     "address": [
         r"address", r"pt'?s?\s*address", r"patient\s*address", r"home\s*address",
@@ -86,18 +92,19 @@ FIELD_LABELS: Dict[str, List[str]] = {
     "insurance": [
         r"insurance", r"insurer", r"insurance\s*(?:company|provider|carrier|plan)",
         r"primary\s*insurance", r"health\s*plan", r"payer", r"policy\s*holder",
-        r"coverage", r"ins\s*\.?\s*co",
+        r"coverage", r"ins\s*\.?\s*co", r"insurance\s*[:\-]",
     ],
     "height": [
         r"height", r"ht\s*[:\-]", r"ht\.", r"height\s*\(?(?:cm|in|ft|inches)?\)?",
-        r"ht\s*\(",
+        r"ht\s*\(", r"height\s*/?\s*bsa",
     ],
     "weight": [
         r"weight", r"wt\s*[:\-]", r"wt\.", r"weight\s*\(?(?:kg|lbs|lb|pounds)?\)?",
-        r"wt\s*\(",
+        r"wt\s*\(", r"weight\s*/?\s*bsa\s*/?\s*bmi",
     ],
     "bmi": [
         r"bmi", r"body\s*mass\s*index", r"bmi\s*[:\-]", r"body\s*mass",
+        r"bmi\s*/?\s*kg",
     ],
 }
 
@@ -117,18 +124,24 @@ DATE_RE = re.compile(
     re.IGNORECASE,
 )
 HEIGHT_RE = re.compile(
+    # 5'10" or 5 ft 10 in or 5.0 ft 3.00 in
     r"(\d{1,2}(?:\.\d+)?)\s*(?:'|′|ft|feet|foot)\s*(?:(\d{1,2}(?:\.\d+)?)\s*(?:\"|″|in|inches|inch))?"
+    # table style: 5.0   3.00   160.02  (ft  in  cm)
+    r"|(\d{1,2}(?:\.\d+)?)\s+(\d{1,2}(?:\.\d+)?)\s+(\d{2,3}(?:\.\d+)?)"
+    # pure cm
     r"|(\d{1,3}(?:\.\d+)?)\s*(?:cm|centimeters?)"
+    # pure inches
     r"|(\d{1,2}(?:\.\d+)?)\s*(?:in|inches|inch|\"|″)",
     re.IGNORECASE,
 )
 WEIGHT_RE = re.compile(
-    r"(\d{2,3}(?:\.\d+)?)\s*(?:kg|kgs|kilograms?)"
-    r"|(\d{2,3}(?:\.\d+)?)\s*(?:lbs?|pounds?|lb)",
+    r"(\d{2,3}(?:\.\d+)?)\s*(?:kg|kgs|kilograms?)\b"
+    r"|(\d{2,3}(?:\.\d+)?)\s*(?:lbs?|pounds?|lb)\b",
     re.IGNORECASE,
 )
 BMI_RE = re.compile(
-    r"(?:bmi|body\s*mass\s*index)\s*[:\-]?\s*(\d{1,2}(?:\.\d{1,2})?)",
+    r"(?:bmi|body\s*mass\s*index|bmi\s*/?\s*kg/?m2?)\s*[:\-]?\s*(\d{1,2}(?:\.\d{1,2})?)"
+    r"|(\d{2}\.\d{1,2})\s*(?:kg/?m2|bmi)?",  # standalone plausible BMI near vitals
     re.IGNORECASE,
 )
 
@@ -472,46 +485,133 @@ def extract_fields_from_block(text: str) -> Dict[str, Optional[str]]:
     addr = find_value_near_label(text, FIELD_LABELS["address"], max_chars=160)
     if addr:
         results["address"] = addr.strip()[:160]
+    else:
+        # Common pattern: name followed by street / city / state zip (no "Address:" label)
+        # Look for a line that looks like a street address near the patient name
+        street_re = re.compile(
+            r"^\s*\d{1,6}\s+[A-Za-z0-9\.\-'\s]+(?:St|Street|Rd|Road|Ave|Avenue|Blvd|Lane|Ln|Dr|Drive|Ct|Court|Way|Pl|Place)\b.*",
+            re.IGNORECASE,
+        )
+        for line in text.splitlines():
+            if street_re.match(line.strip()):
+                # grab this line + possible next city/state line
+                idx = text.splitlines().index(line)
+                parts = [line.strip()]
+                lines = text.splitlines()
+                if idx + 1 < len(lines):
+                    nxt = lines[idx + 1].strip()
+                    if re.search(r"[A-Za-z]+,?\s*[A-Z]{2}\s*\d{5}", nxt) or re.search(r"\b[A-Z]{2}\s*\d{5}", nxt):
+                        parts.append(nxt)
+                results["address"] = ", ".join(parts)[:160]
+                break
 
     # ---- Insurance ----
     ins = find_value_near_label(text, FIELD_LABELS["insurance"], max_chars=90)
     if ins:
-        results["insurance"] = ins.strip()[:90]
+        # Clean common OCR / header noise
+        ins = re.sub(r"^[/\\|]+\s*", "", ins)
+        ins = re.sub(r"\b(?:Authorization|Information|Policy\s*#?|Provider).*$", "", ins, flags=re.I)
+        ins = ins.strip(" :/-")
+        if ins and len(ins) > 2 and not re.match(r"^(Information|Authorization)$", ins, re.I):
+            results["insurance"] = ins[:90]
+    # Fallback: look for well-known payer names near "Insurance"
+    if not results["insurance"]:
+        payer_re = re.compile(
+            r"(?:Insurance|Insurer|Payer|Plan)\s*[:\-]?\s*((?:BCBS|Blue\s*Cross|Aetna|United|Cigna|Medicare|Medicaid|Humana|Tricare|Kaiser|Anthem|Federal)[^\n]{0,40})",
+            re.IGNORECASE,
+        )
+        m = payer_re.search(text)
+        if m:
+            results["insurance"] = m.group(1).strip()[:90]
 
     # ---- Height ----
-    near = find_value_near_label(text, FIELD_LABELS["height"], max_chars=35)
-    m = HEIGHT_RE.search(near or text)
+    # Prefer context near "Height" label; also scan whole text for vital tables
+    near = find_value_near_label(text, FIELD_LABELS["height"], max_chars=80)
+    search_h = near or text
+    m = HEIGHT_RE.search(search_h)
     if m:
         g = m.groups()
-        if g[0]:
+        # groups roughly: (ft_classic, in_classic, ft_table, in_table, cm_table, pure_cm, pure_in)
+        if g[0]:  # classic 5'10" or 5 ft 10
             feet, inches = g[0], g[1] or "0"
             results["height"] = f"{feet}'{inches}\""
-        elif g[2]:
-            results["height"] = f"{g[2]} cm"
-        elif g[3]:
-            results["height"] = f'{g[3]}"'
+        elif g[2] is not None and g[3] is not None:  # table 5.0  3.00  160
+            feet, inches = g[2], g[3]
+            results["height"] = f"{feet}'{inches}\""
+        elif g[4]:  # pure cm
+            results["height"] = f"{g[4]} cm"
+        elif g[5]:  # pure inches
+            results["height"] = f'{g[5]}"'
+
+    # Extra vital-table pattern: "5.0  3.00  160.02"
+    if not results["height"]:
+        vitals_h = re.search(
+            r"(?:Height|Ht).*?(?:ft|in|cm)?.*?(\d{1,2}(?:\.\d+)?)\s+(\d{1,2}(?:\.\d+)?)\s+(\d{2,3}(?:\.\d+)?)",
+            text, re.IGNORECASE | re.DOTALL,
+        )
+        if vitals_h:
+            results["height"] = f"{vitals_h.group(1)}'{vitals_h.group(2)}\""
 
     # ---- Weight ----
-    near = find_value_near_label(text, FIELD_LABELS["weight"], max_chars=35)
-    m = WEIGHT_RE.search(near or text)
+    near = find_value_near_label(text, FIELD_LABELS["weight"], max_chars=80)
+    search_w = near or text
+    m = WEIGHT_RE.search(search_w)
     if m:
         if m.group(1):
             results["weight"] = f"{m.group(1)} kg"
         elif m.group(2):
             results["weight"] = f"{m.group(2)} lbs"
+        elif m.group(3):
+            results["weight"] = f"{m.group(3)} lbs"
+
+    # Extra vital-table pattern: look for plausible adult weight near Weight header
+    if not results["weight"]:
+        # Collect candidate numbers after a Weight-related header
+        section = re.search(
+            r"(?:Weight|Wt|Weight/BSA|Weight\s*/\s*BMI).{0,200}",
+            text, re.IGNORECASE | re.DOTALL,
+        )
+        search_area = section.group(0) if section else text
+        candidates = []
+        for m in re.finditer(r"\b(\d{2,3}(?:\.\d{1,2})?)\b", search_area):
+            try:
+                wval = float(m.group(1))
+                if 80 <= wval <= 450:
+                    candidates.append((wval, m.group(1)))
+            except ValueError:
+                pass
+        if candidates:
+            # Prefer the first plausible weight (usually the lb value)
+            results["weight"] = f"{candidates[0][1]} lbs"
 
     # ---- BMI ----
-    near = find_value_near_label(text, FIELD_LABELS["bmi"], max_chars=20)
-    # Prefer value near an explicit BMI label; avoid matching random numbers
-    search_space = near if near else text
+    near = find_value_near_label(text, FIELD_LABELS["bmi"], max_chars=40)
+    search_space = near or text
     m = BMI_RE.search(search_space)
     if m:
         try:
-            val = float(m.group(1))
+            val_str = m.group(1) or m.group(2)
+            val = float(val_str)
             if 10 < val < 70:
-                results["bmi"] = m.group(1)
-        except ValueError:
+                results["bmi"] = f"{val:.1f}" if "." in str(val_str) else str(val_str)
+        except (ValueError, TypeError):
             pass
+
+    # Extra: look for BMI value in vitals section (prefer numbers after BMI header)
+    if not results["bmi"]:
+        section = re.search(
+            r"(?:BMI|bmi\s*kg/?m2?).{0,120}",
+            text, re.IGNORECASE | re.DOTALL,
+        )
+        if section:
+            for m in re.finditer(r"\b(\d{2}\.\d{1,2})\b", section.group(0)):
+                try:
+                    val = float(m.group(1))
+                    if 10 < val < 70:
+                        results["bmi"] = f"{val:.1f}"
+                        break
+                except ValueError:
+                    pass
 
     # Auto-calculate BMI if missing
     if not results["bmi"] and results["height"] and results["weight"]:
