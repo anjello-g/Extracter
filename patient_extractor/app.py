@@ -34,6 +34,17 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Early check for Tesseract (important on Streamlit Cloud)
+def _check_tesseract():
+    try:
+        ver = pytesseract.get_tesseract_version()
+        return True, str(ver)
+    except Exception as e:
+        return False, str(e)
+
+_TESS_OK, _TESS_MSG = _check_tesseract()
+
+
 # -----------------------------------------------------------------------------
 # Field definitions (OCR-tolerant label variants)
 # -----------------------------------------------------------------------------
@@ -598,6 +609,16 @@ def main():
         Handles one or many patients in a single file. All processing is **local**.
         """
     )
+
+    if not _TESS_OK:
+        st.error(
+            f"**Tesseract OCR is not available** on this server.\n\n"
+            f"Error: `{_TESS_MSG}`\n\n"
+            "On **Streamlit Community Cloud** make sure you have a `packages.txt` file "
+            "in the repository root containing:\n"
+            "```\ntesseract-ocr\ntesseract-ocr-eng\npoppler-utils\n```\n"
+            "Then reboot the app. Text-based (non-scanned) PDFs will still work."
+        )
 
     with st.sidebar:
         st.header("⚙️ Options")
