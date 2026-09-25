@@ -800,7 +800,7 @@ def extract_with_groq(text: str, api_key: str, model: str = "llama-3.3-70b-versa
     return [_normalize_ai_patient(item) for item in items if isinstance(item, dict)]
 
 
-def extract_with_gemini(text: str, api_key: str, model: str = "gemini-2.0-flash") -> List[Dict[str, Optional[str]]]:
+def extract_with_gemini(text: str, api_key: str, model: str = "gemini-3.8-flash") -> List[Dict[str, Optional[str]]]:
     """Call Google Gemini free API for structured extraction."""
     try:
         import google.generativeai as genai
@@ -813,7 +813,7 @@ def extract_with_gemini(text: str, api_key: str, model: str = "gemini-2.0-flash"
         text = text[:14000] + "\n\n[... middle truncated ...]\n\n" + text[-14000:]
 
     # Try current free-tier friendly models in order
-    candidate_models = [model, "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-flash-latest"]
+    candidate_models = [model, "gemini-3.8-flash"]
     last_err = None
     raw = None
 
@@ -887,8 +887,7 @@ def main():
     st.title("🏥 Patient Detail Extractor")
     st.markdown(
         """
-        **Ultra-accurate multi-patient extraction** from PDFs & images.  
-        Handles one or many patients in a single file. All processing is **local**.
+        **
         """
     )
 
@@ -910,8 +909,8 @@ def main():
                                    help="Disable multi-patient splitting")
 
         st.markdown("---")
-        st.header("🤖 Free AI Extraction")
-        st.caption("Optional — greatly improves accuracy on varied formats. Free tiers available.")
+        st.header("")
+        st.caption("")
 
         # Prefer Streamlit secrets if present (recommended on Cloud)
         # Default provider is Gemini (user preference)
@@ -945,18 +944,10 @@ def main():
         st.markdown("---")
         st.markdown(
             """
-            **Supported**  
-            PDF · PNG · JPG · TIFF · BMP
-
-            **Best accuracy**  
-            • Enable free AI (Groq / Gemini)  
-            • ≥ 200–300 DPI scans  
-            • Clear printed text  
-
-            Always review results — medical data is critical.
+            
             """
         )
-        st.caption("OCR is local. AI (if enabled) sends OCR text only to the chosen provider.")
+        st.caption("")
 
     uploaded = st.file_uploader(
         "Upload PDF or Image (supports multiple patients)",
@@ -968,12 +959,7 @@ def main():
         st.info("👆 Upload a document to begin.")
         st.markdown(
             """
-            ### What this app extracts
-            | Field | Field | Field |
-            |-------|-------|-------|
-            | PT's Name | PT's Phone | PT's DOB |
-            | PT's Email | PT's Diagnosis | Referrer |
-            | Address | Insurance | Height / Weight / BMI |
+            
             """
         )
         return
@@ -981,7 +967,7 @@ def main():
     file_bytes = uploaded.read()
     is_pdf = (uploaded.type == "application/pdf") or uploaded.name.lower().endswith(".pdf")
 
-    with st.spinner("Extracting text (OCR if needed)…"):
+    with st.spinner("Extracting text"):
         if is_pdf:
             full_text, page_images, page_texts = extract_text_from_pdf(file_bytes)
         else:
