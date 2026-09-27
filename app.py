@@ -17,6 +17,8 @@ from datetime import datetime
 from typing import Dict, Optional, List, Tuple, Any
 from pathlib import Path
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 
 import pdfplumber
 from pdf2image import convert_from_bytes
@@ -90,9 +92,9 @@ FIELD_LABELS: Dict[str, List[str]] = {
         r"physical\s*address",
     ],
     "insurance": [
-        r"insurance", r"insurer", r"insurance\s*(?:company|provider|carrier|plan)",
-        r"primary\s*insurance", r"health\s*plan", r"payer", r"policy\s*holder",
-        r"coverage", r"ins\s*\.?\s*co", r"insurance\s*[:\-]",
+        r"insurance\s*(?:company|provider|carrier|plan)", r"primary\s*insurance",
+        r"insurance\s*[:\-]", r"insurer", r"health\s*plan", r"payer",
+        r"policy\s*holder", r"coverage", r"ins\s*\.?\s*co", r"insurance",
     ],
     "height": [
         r"height", r"ht\s*[:\-]", r"ht\.", r"height\s*\(?(?:cm|in|ft|inches)?\)?",
@@ -141,9 +143,27 @@ WEIGHT_RE = re.compile(
 )
 BMI_RE = re.compile(
     r"(?:bmi|body\s*mass\s*index|bmi\s*/?\s*kg/?m2?)\s*[:\-]?\s*(\d{1,2}(?:\.\d{1,2})?)"
-    r"|(\d{2}\.\d{1,2})\s*(?:kg/?m2|bmi)?",  # standalone plausible BMI near vitals
+    r"|(?<![A-Za-z])(\d{2}\.\d{1,2})\s*(?:kg/?m2|bmi)?",  # standalone plausible BMI near vitals
+    # (?<![A-Za-z]) keeps this from matching the decimal part of an ICD code like "E11.9"
     re.IGNORECASE,
 )
+
+# ICD-10-CM style codes (e.g. E11.9, I10, M54.5, Z00.00) and ICD-9-CM style
+# codes (e.g. 250.00, 401.9) used to tag diagnoses.
+DIAGNOSIS_CODE_RE = re.compile(
+    r"\b[A-TV-Z][0-9]{2}(?:\.[0-9A-TV-Z]{1,4})?\b"   # ICD-10-CM
+    r"|\b[0-9]{3}\.[0-9]{1,2}\b"                      # ICD-9-CM
+)
+
+# Labels that precede a member / subscriber / policy identifier
+MEMBER_ID_LABELS = [
+    r"member\s*id", r"member\s*#", r"member\s*no", r"member\s*number",
+    r"subscriber\s*id", r"subscriber\s*#", r"subscriber\s*no", r"subscriber\s*number",
+    r"insurance\s*id", r"policy\s*(?:#|no\.?|number)", r"id\s*#",
+    r"group\s*(?:#|no\.?|number)",
+]
+# A plausible member/subscriber/policy ID: alphanumeric, 5-20 chars, at least one digit
+MEMBER_ID_VALUE_RE = re.compile(r"\b(?=[A-Za-z0-9\-]{5,20}\b)[A-Za-z0-9\-]*\d[A-Za-z0-9\-]*\b")
 
 # Strong patient-start signals
 PATIENT_START_PATTERNS = [
@@ -207,40 +227,57 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     return img
 
 
-def ocr_image(img: Image.Image, lang: str = "eng") -> str:
-    """Run multiple Tesseract configs and keep the best result."""
-    pre = preprocess_image(img)
+# Config sets: "fast" tries the two most reliable layouts and stops early
+# once it gets a good result; "full" (accuracy mode) tries every layout.
+OCR_CONFIGS_FAST = [
+    "--oem 3 --psm 6",   # uniform block (best general-purpose default)
+    "--oem 3 --psm 4",   # single column
+]
+OCR_CONFIGS_FULL = OCR_CONFIGS_FAST + [
+    "--oem 3 --psm 3",   # fully automatic
+    "--oem 3 --psm 11",  # sparse text
+    "--oem 3 --psm 1",   # automatic with OSD
+]
 
-    configs = [
-        "--oem 3 --psm 6",   # uniform block
-        "--oem 3 --psm 4",   # single column
-        "--oem 3 --psm 3",   # fully automatic
-        "--oem 3 --psm 11",  # sparse text
-        "--oem 3 --psm 1",   # automatic with OSD
-    ]
+_MED_KEYWORDS = ("patient", "name", "dob", "phone", "diagnosis", "referr", "insurance", "height", "weight")
+
+
+def _score_text(text: str) -> int:
+    score = len(re.findall(r"[A-Za-z0-9]", text))
+    lower = text.lower()
+    for kw in _MED_KEYWORDS:
+        if kw in lower:
+            score += 40
+    return score
+
+
+def ocr_image(img: Image.Image, lang: str = "eng", fast_mode: bool = True, early_exit_score: int = 400) -> str:
+    """
+    Run Tesseract with one or more configs and keep the best-scoring result.
+    fast_mode uses fewer configs and exits as soon as a config scores well
+    (usually the first one), which is the biggest lever for OCR speed.
+    """
+    pre = preprocess_image(img)
+    configs = OCR_CONFIGS_FAST if fast_mode else OCR_CONFIGS_FULL
 
     best_text, best_score = "", -1
-
     for cfg in configs:
         try:
             text = pytesseract.image_to_string(pre, lang=lang, config=cfg)
-            score = len(re.findall(r"[A-Za-z0-9]", text))
-            # Bonus for medical keywords
-            lower = text.lower()
-            for kw in ("patient", "name", "dob", "phone", "diagnosis", "referr", "insurance", "height", "weight"):
-                if kw in lower:
-                    score += 40
+            score = _score_text(text)
             if score > best_score:
                 best_score = score
                 best_text = text
+            if best_score >= early_exit_score:
+                break  # good enough — skip remaining configs
         except Exception:
             continue
 
-    # Fallback on original if preprocessed is weak
+    # Fallback on original (un-preprocessed) image only if everything was weak
     if best_score < 100:
         try:
             text = pytesseract.image_to_string(img, lang=lang, config="--oem 3 --psm 6")
-            score = len(re.findall(r"[A-Za-z0-9]", text))
+            score = _score_text(text)
             if score > best_score:
                 best_text = text
         except Exception:
@@ -268,11 +305,40 @@ def _render_pdf_pages_pypdfium2(file_bytes: bytes, dpi: int = 300) -> List[Image
     return images
 
 
-def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, List[Image.Image], List[str]]:
+def _ocr_pages_parallel(ocr_images: List[Image.Image], fast_mode: bool, max_workers: int = 4) -> List[str]:
+    """OCR multiple page/frame images concurrently (Tesseract runs as a
+    subprocess per call, so threads give real wall-clock speedup here)."""
+    if len(ocr_images) <= 1:
+        return [ocr_image(im, fast_mode=fast_mode) for im in ocr_images]
+
+    results: List[Optional[str]] = [None] * len(ocr_images)
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(ocr_images))) as ex:
+        futures = {ex.submit(ocr_image, im, "eng", fast_mode): i for i, im in enumerate(ocr_images)}
+        done = 0
+        progress = st.progress(0.0, text="OCR in progress…")
+        from concurrent.futures import as_completed
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                results[i] = fut.result()
+            except Exception:
+                results[i] = ""
+            done += 1
+            progress.progress(done / len(ocr_images), text=f"OCR page {done}/{len(ocr_images)}")
+        progress.empty()
+    return [r or "" for r in results]
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def extract_text_from_pdf(file_bytes: bytes, fast_mode: bool = True, dpi: int = 250) -> Tuple[str, List[Image.Image], List[str]]:
     """
     Returns (full_text, page_images, page_texts)
     page_texts keeps per-page text for better multi-patient splitting.
     Robust: tries pdfplumber → pdf2image → pypdfium2 fallback.
+
+    Cached by (file bytes, fast_mode, dpi) so re-running the Streamlit script
+    on every widget interaction does NOT re-OCR the document — this is the
+    single biggest speed win, since Streamlit reruns main() on every click.
     """
     page_texts: List[str] = []
     images: List[Image.Image] = []
@@ -284,7 +350,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, List[Image.Image], Li
                 page_text = page.extract_text() or ""
                 page_texts.append(page_text)
                 try:
-                    im = page.to_image(resolution=200).original
+                    im = page.to_image(resolution=150).original
                     images.append(im)
                 except Exception:
                     pass
@@ -296,17 +362,17 @@ def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, List[Image.Image], Li
 
     # 2. If sparse text → treat as scanned and OCR
     if alpha < 150:
-        st.info("📄 Scanned / image-based PDF detected → running high-quality OCR…")
+        st.info("📄 Scanned / image-based PDF detected → running OCR…")
         ocr_images: List[Image.Image] = []
 
         # Try A: pdf2image (poppler)
         try:
-            ocr_images = convert_from_bytes(file_bytes, dpi=300)
+            ocr_images = convert_from_bytes(file_bytes, dpi=dpi)
         except Exception as e1:
             st.warning(f"pdf2image/poppler path failed ({e1}). Trying alternative renderer…")
             # Try B: pypdfium2 (pure Python, very reliable)
             try:
-                ocr_images = _render_pdf_pages_pypdfium2(file_bytes, dpi=300)
+                ocr_images = _render_pdf_pages_pypdfium2(file_bytes, dpi=dpi)
             except Exception as e2:
                 st.error(f"All PDF→image methods failed.\n• pdf2image: {e1}\n• pypdfium2: {e2}")
                 # Last resort: keep whatever images pdfplumber managed to give us
@@ -314,33 +380,26 @@ def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, List[Image.Image], Li
 
         if ocr_images:
             images = ocr_images
-            page_texts = []
-            progress = st.progress(0.0, text="OCR in progress…")
-            for i, img in enumerate(ocr_images):
-                page_texts.append(ocr_image(img))
-                progress.progress((i + 1) / len(ocr_images), text=f"OCR page {i+1}/{len(ocr_images)}")
-            progress.empty()
+            page_texts = _ocr_pages_parallel(ocr_images, fast_mode=fast_mode)
             full_text = "\n\n".join(page_texts)
 
     return full_text, images, page_texts
 
 
-def extract_text_from_image(file_bytes: bytes) -> Tuple[str, List[Image.Image], List[str]]:
+@st.cache_data(show_spinner=False, max_entries=8)
+def extract_text_from_image(file_bytes: bytes, fast_mode: bool = True) -> Tuple[str, List[Image.Image], List[str]]:
     img = Image.open(io.BytesIO(file_bytes))
-    texts = []
-    images = []
+    frames = []
 
     if hasattr(img, "n_frames") and img.n_frames > 1:
         for i in range(img.n_frames):
             img.seek(i)
-            frame = img.copy()
-            images.append(frame)
-            texts.append(ocr_image(frame))
+            frames.append(img.copy())
     else:
-        images.append(img)
-        texts.append(ocr_image(img))
+        frames.append(img)
 
-    return "\n\n".join(texts), images, texts
+    texts = _ocr_pages_parallel(frames, fast_mode=fast_mode)
+    return "\n\n".join(texts), frames, texts
 
 
 # -----------------------------------------------------------------------------
@@ -430,6 +489,144 @@ def find_value_near_label(text: str, label_patterns: List[str], max_chars: int =
     return None
 
 
+def find_section_block(
+    text: str,
+    label_patterns: List[str],
+    max_lines: int = 12,
+    stop_labels: Optional[List[str]] = None,
+) -> Optional[str]:
+    """
+    Capture a *multi-line* block following a label (unlike find_value_near_label,
+    which only grabs a single value). Stops at the next recognized field label,
+    two consecutive blank lines, or max_lines.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        for pat in label_patterns:
+            m = re.search(pat, line, re.IGNORECASE)
+            if not m:
+                continue
+            block_lines = []
+            after = line[m.end():].strip(" :-–—\t")
+            if after:
+                block_lines.append(after)
+            j = i + 1
+            blank_run = 0
+            while j < len(lines) and len(block_lines) < max_lines:
+                nxt = lines[j].strip()
+                if not nxt:
+                    blank_run += 1
+                    if blank_run >= 2:
+                        break
+                    j += 1
+                    continue
+                blank_run = 0
+                if stop_labels and any(re.search(p, nxt, re.IGNORECASE) for p in stop_labels):
+                    break
+                block_lines.append(nxt)
+                j += 1
+            if block_lines:
+                return "\n".join(block_lines)
+    return None
+
+
+def extract_diagnoses(text: str) -> Optional[str]:
+    """
+    Find every present diagnosis mentioned in/near the diagnosis section and
+    return them as 'Description (Code)' entries joined by '; '.
+    Falls back gracefully when codes or descriptions are missing.
+    """
+    # Everything that is NOT a diagnosis label acts as a stop marker for the block
+    stop_labels: List[str] = []
+    for key, pats in FIELD_LABELS.items():
+        if key != "diagnosis":
+            stop_labels.extend(pats)
+
+    block = find_section_block(text, FIELD_LABELS["diagnosis"], max_lines=15, stop_labels=stop_labels)
+    if not block:
+        return None
+
+    # Strip bullet / numbering prefixes so each line becomes a clean entry
+    block = re.sub(r"^\s*[\-\u2022\*]\s*", "", block, flags=re.MULTILINE)
+    block = re.sub(r"^\s*\d{1,2}[\.\)]\s*", "", block, flags=re.MULTILINE)
+
+    # Diagnoses are typically separated by newlines or semicolons; commas are
+    # ambiguous (can appear inside a single diagnosis description) so we don't split on them.
+    raw_entries = re.split(r"[\n;]+", block)
+
+    entries: List[str] = []
+    seen = set()
+    for raw in raw_entries:
+        raw = raw.strip(" .,:-")
+        if not raw or len(raw) < 2:
+            continue
+        # Skip stray lines that are actually a different field leaking in
+        if any(re.search(p, raw, re.IGNORECASE) for p in stop_labels):
+            continue
+
+        code_match = DIAGNOSIS_CODE_RE.search(raw)
+        code = code_match.group(0).upper() if code_match else None
+        desc = DIAGNOSIS_CODE_RE.sub("", raw).strip(" -–—:(),")
+        desc = re.sub(r"\s{2,}", " ", desc)
+
+        if code and desc:
+            entry = f"{desc} ({code})"
+        elif code:
+            entry = code
+        elif desc and len(desc) > 2:
+            entry = desc
+        else:
+            continue
+
+        key = entry.lower()
+        if key not in seen:
+            seen.add(key)
+            entries.append(entry)
+
+    if not entries:
+        return None
+    return "; ".join(entries[:15])
+
+
+def extract_insurance_with_id(text: str) -> Optional[str]:
+    """
+    Return 'Insurance Name - Member/Subscriber ID' when both are found,
+    or just whichever piece is available.
+    """
+    name = None
+    ins = find_value_near_label(text, FIELD_LABELS["insurance"], max_chars=90)
+    if ins:
+        ins = re.sub(r"^[/\\|]+\s*", "", ins)
+        ins = re.sub(r"\b(?:Authorization|Information|Policy\s*#?|Provider).*$", "", ins, flags=re.I)
+        ins = ins.strip(" :/-")
+        if ins and len(ins) > 2 and not re.match(r"^(Information|Authorization)$", ins, re.I):
+            name = ins[:90]
+
+    if not name:
+        payer_re = re.compile(
+            r"(?:Insurance|Insurer|Payer|Plan)\s*[:\-]?\s*((?:BCBS|Blue\s*Cross|Aetna|United|Cigna|Medicare|Medicaid|Humana|Tricare|Kaiser|Anthem|Federal)[^\n]{0,40})",
+            re.IGNORECASE,
+        )
+        m = payer_re.search(text)
+        if m:
+            name = m.group(1).strip()[:90]
+
+    member_id = None
+    id_near = find_value_near_label(text, MEMBER_ID_LABELS, max_chars=40)
+    if id_near:
+        m = MEMBER_ID_VALUE_RE.search(id_near)
+        if m:
+            member_id = m.group(0).strip(" -")
+
+    if name and member_id:
+        return f"{name} - {member_id}"
+    elif name:
+        return name
+    elif member_id:
+        return member_id
+    return None
+
+
 def extract_fields_from_block(text: str) -> Dict[str, Optional[str]]:
     """High-accuracy extraction from one patient text block."""
     text = normalize_text(text)
@@ -470,11 +667,16 @@ def extract_fields_from_block(text: str) -> Dict[str, Optional[str]]:
     if m:
         results["email"] = m.group().lower().strip()
 
-    # ---- Diagnosis ----
-    diag = find_value_near_label(text, FIELD_LABELS["diagnosis"], max_chars=220)
-    if diag:
-        diag = re.split(r"\n{2,}|(?=\b(?:Referrer|Address|Insurance|Height|Weight|BMI)\b)", diag)[0]
-        results["diagnosis"] = diag.strip()[:220]
+    # ---- Diagnosis (all present diagnoses + codes, separated by "; ") ----
+    multi_diag = extract_diagnoses(text)
+    if multi_diag:
+        results["diagnosis"] = multi_diag[:500]
+    else:
+        # Fallback to the original single-value grab if no section block was found
+        diag = find_value_near_label(text, FIELD_LABELS["diagnosis"], max_chars=220)
+        if diag:
+            diag = re.split(r"\n{2,}|(?=\b(?:Referrer|Address|Insurance|Height|Weight|BMI)\b)", diag)[0]
+            results["diagnosis"] = diag.strip()[:220]
 
     # ---- Referrer ----
     ref = find_value_near_label(text, FIELD_LABELS["referrer"], max_chars=90)
@@ -505,24 +707,10 @@ def extract_fields_from_block(text: str) -> Dict[str, Optional[str]]:
                 results["address"] = ", ".join(parts)[:160]
                 break
 
-    # ---- Insurance ----
-    ins = find_value_near_label(text, FIELD_LABELS["insurance"], max_chars=90)
-    if ins:
-        # Clean common OCR / header noise
-        ins = re.sub(r"^[/\\|]+\s*", "", ins)
-        ins = re.sub(r"\b(?:Authorization|Information|Policy\s*#?|Provider).*$", "", ins, flags=re.I)
-        ins = ins.strip(" :/-")
-        if ins and len(ins) > 2 and not re.match(r"^(Information|Authorization)$", ins, re.I):
-            results["insurance"] = ins[:90]
-    # Fallback: look for well-known payer names near "Insurance"
-    if not results["insurance"]:
-        payer_re = re.compile(
-            r"(?:Insurance|Insurer|Payer|Plan)\s*[:\-]?\s*((?:BCBS|Blue\s*Cross|Aetna|United|Cigna|Medicare|Medicaid|Humana|Tricare|Kaiser|Anthem|Federal)[^\n]{0,40})",
-            re.IGNORECASE,
-        )
-        m = payer_re.search(text)
-        if m:
-            results["insurance"] = m.group(1).strip()[:90]
+    # ---- Insurance (Name - Member/Subscriber ID) ----
+    ins_combined = extract_insurance_with_id(text)
+    if ins_combined:
+        results["insurance"] = ins_combined[:140]
 
     # ---- Height ----
     # Prefer context near "Height" label; also scan whole text for vital tables
@@ -564,25 +752,27 @@ def extract_fields_from_block(text: str) -> Dict[str, Optional[str]]:
         elif m.group(3):
             results["weight"] = f"{m.group(3)} lbs"
 
-    # Extra vital-table pattern: look for plausible adult weight near Weight header
+    # Extra vital-table pattern: look for plausible adult weight near an actual
+    # Weight header. Unlike before, we do NOT fall back to scanning the whole
+    # document — that produced false positives on unrelated numbers (IDs, phone
+    # digits, etc.) whenever no explicit "Weight:" label existed.
     if not results["weight"]:
-        # Collect candidate numbers after a Weight-related header
         section = re.search(
-            r"(?:Weight|Wt|Weight/BSA|Weight\s*/\s*BMI).{0,200}",
+            r"(?:Weight|Wt|Weight/BSA|Weight\s*/\s*BMI)\b.{0,200}",
             text, re.IGNORECASE | re.DOTALL,
         )
-        search_area = section.group(0) if section else text
-        candidates = []
-        for m in re.finditer(r"\b(\d{2,3}(?:\.\d{1,2})?)\b", search_area):
-            try:
-                wval = float(m.group(1))
-                if 80 <= wval <= 450:
-                    candidates.append((wval, m.group(1)))
-            except ValueError:
-                pass
-        if candidates:
-            # Prefer the first plausible weight (usually the lb value)
-            results["weight"] = f"{candidates[0][1]} lbs"
+        if section:
+            candidates = []
+            for m in re.finditer(r"\b(\d{2,3}(?:\.\d{1,2})?)\b", section.group(0)):
+                try:
+                    wval = float(m.group(1))
+                    if 80 <= wval <= 450:
+                        candidates.append((wval, m.group(1)))
+                except ValueError:
+                    pass
+            if candidates:
+                # Prefer the first plausible weight (usually the lb value)
+                results["weight"] = f"{candidates[0][1]} lbs"
 
     # ---- BMI ----
     near = find_value_near_label(text, FIELD_LABELS["bmi"], max_chars=40)
@@ -720,8 +910,15 @@ Rules:
 - patient_name: full name only (no titles unless part of the name)
 - phone: format as (XXX) XXX-XXXX when possible
 - dob: keep original format found (MM/DD/YYYY preferred)
-- diagnosis: primary / billing diagnosis; include secondary only if clearly important
+- diagnosis: list EVERY diagnosis present in the document (not just the primary one),
+  each formatted as "Description (Code)" using its ICD-9/ICD-10 code when one is given,
+  or just the description or just the code if only one is present. Separate multiple
+  diagnoses with "; ". Example: "Type 2 diabetes mellitus (E11.9); Essential hypertension (I10)"
 - referrer: ordering provider, referring physician, or PCP name
+- address: full street address
+- insurance: format as "Insurance Name - Member ID" (use the subscriber ID if no
+  member ID is given). If only the name or only the ID is present, return just that.
+  Example: "Blue Cross Blue Shield - ABC123456789"
 - height: prefer ft'in" (e.g. 5'3") or cm
 - weight: include unit (lbs or kg)
 - bmi: numeric value only
@@ -756,7 +953,8 @@ def _normalize_ai_patient(obj: dict) -> Dict[str, Optional[str]]:
     for k, v in obj.items():
         canon = key_map.get(str(k).lower().strip())
         if canon and v is not None and str(v).strip().lower() not in ("null", "none", "n/a", ""):
-            out[canon] = str(v).strip()[:220]
+            cap = 400 if canon == "diagnosis" else 220
+            out[canon] = str(v).strip()[:cap]
     return out
 
 
@@ -907,6 +1105,11 @@ def main():
         show_images = st.checkbox("Show page previews", value=False)
         force_single = st.checkbox("Force single-patient mode", value=False,
                                    help="Disable multi-patient splitting")
+        fast_mode = st.checkbox(
+            "⚡ Fast mode", value=True,
+            help="Fewer OCR passes + early exit + parallel pages. Turn off for maximum "
+                 "accuracy on very poor-quality scans (slower)."
+        )
 
         st.markdown("---")
         st.header("")
@@ -969,9 +1172,9 @@ def main():
 
     with st.spinner("Extracting text"):
         if is_pdf:
-            full_text, page_images, page_texts = extract_text_from_pdf(file_bytes)
+            full_text, page_images, page_texts = extract_text_from_pdf(file_bytes, fast_mode=fast_mode)
         else:
-            full_text, page_images, page_texts = extract_text_from_image(file_bytes)
+            full_text, page_images, page_texts = extract_text_from_image(file_bytes, fast_mode=fast_mode)
 
     if not full_text or len(re.findall(r"[A-Za-z0-9]", full_text)) < 25:
         st.error("No meaningful text could be extracted. Try a clearer scan.")
