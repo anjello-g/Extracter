@@ -958,7 +958,7 @@ def _normalize_ai_patient(obj: dict) -> Dict[str, Optional[str]]:
     return out
 
 
-def extract_with_groq(text: str, api_key: str, model: str = "llama-3.3-70b-versatile") -> List[Dict[str, Optional[str]]]:
+def extract_with_groq(text: str, api_key: str, model: str = "llama-3.1-8b-instant") -> List[Dict[str, Optional[str]]]:
     """Call Groq free API for structured extraction."""
     try:
         from groq import Groq
@@ -998,8 +998,8 @@ def extract_with_groq(text: str, api_key: str, model: str = "llama-3.3-70b-versa
     return [_normalize_ai_patient(item) for item in items if isinstance(item, dict)]
 
 
-def extract_with_gemini(text: str, api_key: str, model: str = "gemini-3.8-flash") -> List[Dict[str, Optional[str]]]:
-    """Call Google Gemini free API for structured extraction."""
+def extract_with_gemini(text: str, api_key: str, model: str = "gemini-3.5-flash-lite") -> List[Dict[str, Optional[str]]]:
+    """"""
     try:
         import google.generativeai as genai
     except ImportError:
@@ -1011,7 +1011,8 @@ def extract_with_gemini(text: str, api_key: str, model: str = "gemini-3.8-flash"
         text = text[:14000] + "\n\n[... middle truncated ...]\n\n" + text[-14000:]
 
     # Try current free-tier friendly models in order
-    candidate_models = [model, "gemini-3.8-flash"]
+    # Flash-Lite models have the highest free daily quota (~500/day); fall through to the next on 429/quota errors
+    candidate_models = [model, "gemini-3.1-flash-lite", "gemini-3.8-flash"]
     last_err = None
     raw = None
 
@@ -1053,19 +1054,23 @@ def extract_with_gemini(text: str, api_key: str, model: str = "gemini-3.8-flash"
     return [_normalize_ai_patient(item) for item in items if isinstance(item, dict)]
 
 
+@st.cache_data(show_spinner=False, max_entries=16)
+def _extract_with_ai_cached(full_text: str, provider: str, api_key: str) -> List[Dict[str, Optional[str]]]:
+    """Cached so Streamlit reruns (every widget click) don't burn API quota.
+    Exceptions are NOT cached, so a failed/quota-limited call can be retried."""
+    if provider == "groq":
+        return extract_with_groq(full_text, api_key)
+    elif provider in ("gemini", "google"):
+        return extract_with_gemini(full_text, api_key)
+    raise ValueError(f"Unknown AI provider: {provider}")
+
+
 def extract_with_ai(full_text: str, provider: str, api_key: str) -> List[Dict[str, Optional[str]]]:
-    """Dispatch to the selected free AI provider."""
+    """Dispatch to the selected free AI provider (cached per document)."""
     if not api_key or not api_key.strip():
         return []
-    provider = (provider or "").lower()
     try:
-        if provider == "groq":
-            return extract_with_groq(full_text, api_key.strip())
-        elif provider in ("gemini", "google"):
-            return extract_with_gemini(full_text, api_key.strip())
-        else:
-            st.warning(f"Unknown AI provider: {provider}")
-            return []
+        return _extract_with_ai_cached(full_text, (provider or "").lower(), api_key.strip())
     except Exception as e:
         st.error(f"AI extraction failed ({provider}): {e}")
         return []
