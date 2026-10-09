@@ -7,3 +7,13 @@ numpy>=1.24.0
 pypdfium2>=4.0.0
 groq>=0.9.0
 google-generativeai>=0.7.0
+
+streamlit
+pdfplumber
+pypdfium2
+pillow
+pytesseract
+pandas
+groq
+google-genai
+
